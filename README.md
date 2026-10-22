@@ -1,123 +1,193 @@
-# Advanced Apache Airflow — MinIO, Mapping, Assets & Sensors
+# Advanced Airflow Orchestration — Producer & Consumer
 
-Praktiki Apache Airflow layihəsi: **Dynamic Task Mapping**, CSV/JSON branching, trigger rules, Asset-based Scheduling və DAG-lar arası asılılıqlar. Mühit: **Apache Airflow 3.1.0**, Docker Compose, **LocalExecutor**, MinIO və PostgreSQL 16.
+**Apache Airflow 3.1.0 · Docker Compose · LocalExecutor · MinIO · S3Hook · Asset Scheduling**
 
-> **İcra vəziyyəti:** 1, 2, 3, 4 və 6-cı tapşırıqlar Airflow UI-də test olunub. 5-ci tapşırıq üçün catchup qərarı və 3 günlük **backfill planı**, 7-ci tapşırıq üçün isə **deferrable/Triggerer nəzəri izahı** verilir. Backfill və deferrable rejiminin real icrası bu layihədə təsdiqlənməyib.
+Bu layihə müəllimin verdiyi **7 tələbi cəmi 2 DAG** daxilində nümayiş etdirir. `producer` DAG-ı ilk dörd praktiki tələbi icra edir; `consumer` isə Asset event ilə avtomatik başlayır və başqa DAG-dakı `load_source` task-ını `ExternalTaskSensor` ilə gözləyir. **5-ci tapşırıq üçün backfill planı, 7-ci üçün deferrable/Triggerer izahı sənədləşdirilib**, amma bu iki hissənin ayrıca praktik icrası göstərilmir.
 
-## Texnologiyalar
+> **Test sübutu:** 22 oktyabr 2026, son uğurlu `producer` run təxminən 17:46:02 (Bakı vaxtı), `consumer` Asset-triggered run isə 17:46:12. Ekran görüntülərində görünən **əvvəlki uğursuz Consumer run** əvvəlki kod versiyasına aiddir; son run uğurludur.
 
-- Apache Airflow 3.1.0 (TaskFlow API / Standard və Amazon provider-ləri)
-- Docker Compose, LocalExecutor
-- MinIO (S3-compatible object storage)
-- `S3Hook` və Airflow Connection: `minio_s3`
-- PostgreSQL 16 (Airflow metadata bazası)
+## Arxitektura və texnologiyalar
 
-## DAG-lar və tapşırıqlar
+```text
+                          PRODUCER (manual Trigger)
+load_source → discover_files → process_file.expand() → select_branch
+                                                     ├─ process_csv ─┐
+                                                     └─ process_json ┤
+                                                                    ↓
+                                                                   join
+                                                                    ↓
+                                                                 cleanup
+                                                                    ↓
+                                                               publish_sales
+                                                                    │
+                                             sales Asset update event
+                                                                    ↓
+                                    CONSUMER (asset-triggered, automatic)
+                                     wait_for_ingestion → mart_build
+                                     ExternalTaskSensor    S3Hook.read_key
+```
 
-| № | Mövzu | DAG | Nəticə |
+- Airflow: **3.1.0**, `LocalExecutor`, PostgreSQL 16 metadata DB
+- Object storage: **MinIO**, bucket `advance-airflow`, Connection ID `minio_s3`
+- Asset URI: `s3://advance-airflow/curated/sales.csv`
+- İcra qaydası: Airflow UI-də yalnız **`producer`** manual trigger edilir; `consumer` yeni Asset event ilə işə düşür.
+
+| № | Müəllimin tələbi | DAG / mexanizm | Təqdim olunan sübut |
 |---|---|---|---|
-| 1 | MinIO fayl siyahısı + Dynamic Task Mapping | `minio_dynamic_mapping` | Yoxlanılıb |
-| 2 | CSV / JSON branching | `csv_json_branching` | Yoxlanılıb |
-| 3 | Join və cleanup trigger rules | `csv_json_branching` | Yoxlanılıb; `all_done` üçün failure ssenarisi ayrıca test edilməyib |
-| 4 | Producer/Consumer Asset event | `sales_producer`, `sales_consumer` | Yoxlanılıb |
-| 5 | Catchup qərarı, 3 günlük backfill | `daily_sales` (nümunə / plan) | Planlaşdırılıb, icra təsdiqlənməyib |
-| 6 | `ExternalTaskSensor` ilə `load_source` gözləməsi | `source_ingestion`, `source_waiter` | Yoxlanılıb |
-| 7 | Deferrable rejimi və Triggerer | README izahı | Nəzəri izah; real Triggerer testi edilməyib |
+| 1 | Fayl siyahısı və Dynamic Task Mapping | `producer`: `discover_files`, `process_file.expand()` | **4** uğurlu mapped instance |
+| 2 | CSV/JSON branch-lərinin seçilməsi | `producer`: `select_branch`, `process_csv`, `process_json` | Hər iki branch seçilib və icra olunub |
+| 3 | Join `none_failed_min_one_success`, cleanup `all_done` | `producer`: `join`, `cleanup` | Hər iki task uğurludur; qaydalar kodda görünür |
+| 4 | Sales Asset publish, Consumer event ilə başlasın | `producer.publish_sales` → `consumer` | Asset event və avtomatik Consumer run |
+| 5 | Catchup qərarı, 3 günlük backfill planı | Konfiqurasiya + bu README | **Plan / izah**, icra edilməyib |
+| 6 | Digər DAG-dakı `load_source`-u gözləyən sensor | `consumer.wait_for_ingestion` | Sensor uyğun Producer task-ını tapıb uğurla keçib |
+| 7 | Deferrable rejim, Triggerer tələbi | Sensor alternativi + bu README | **Nəzəri izah**, Triggerer testi edilməyib |
 
-## 1. Dynamic Task Mapping
+![Producer DAG overview](screenshots_second/producer-overview.png)
 
-`minio_dynamic_mapping` DAG-ında `discover_files` task-ı `S3Hook.list_keys()` ilə `advance-airflow` bucket-indəki obyekt adlarını qaytarır. `process_file.expand(file_name=discover_files())` hər fayl üçün ayrıca **mapped task instance** yaradır.
+---
 
-Test zamanı `customers.csv`, `orders.json`, `sales.csv` faylları üçün **3 mapped instance** uğurlu tamamlanıb. Bu mərhələdə task fayl formatını müəyyənləşdirib log yazır; tam data transformasiyası etmir.
+## 1. Fayl siyahısı və Dynamic Task Mapping
+
+**Sual:** Fayl siyahısını qaytaran task yaradın və həmin siyahını Dynamic Task Mapping ilə emal edin.
+
+**Həll:** `discover_files` `S3Hook.list_keys(bucket_name="advance-airflow")` ilə MinIO obyektlərinin adlarını alır, yalnız `.csv` və `.json` uzantılı key-ləri saxlayır. `process_file.expand(file_name=files)` hər key üçün ayrıca task instance yaradır. Bu mapped task fayl adını və formatını loga yazır; faylın məzmununun oxunması növbəti branch task-larında aparılır.
 
 ```python
 files = discover_files()
-process_file.expand(file_name=files)
+mapped = process_file.expand(file_name=files)
 ```
 
-## 2. CSV / JSON Branching
+**Real nəticə:** `discover_files` logu `curated/sales.csv`, `customers.csv`, `orders.json`, `sales.csv` fayllarını qaytarır; buna görə **4 mapped instance** yaranıb. Əvvəlki sınaqlarda 3 idi; yeni `curated/sales.csv` əlavə olunduğuna görə say 4-ə yüksəlib. Bu nümunədə curated fayl da siyahıya daxil edilir; istehsal layihəsində yalnız raw/source prefix seçmək daha məqsədəuyğundur.
 
-`csv_json_branching` DAG-ı `get_file_list` vasitəsilə faylları MinIO-dan avtomatik alır, `@task.branch` ilə uyğun `process_csv` və `process_json` yollarını seçir. Bucket-də hər iki format varsa, hər iki yol işləyir. CSV task-ı `csv.DictReader`, JSON task-ı `json.loads` istifadə edir.
+![MinIO discovered files](screenshots_second/discover-files.png)
 
-Bu DAG-da hər format üçün **bir task** var və uyğun fayllar həmin task daxilində dövr ilə işlənir; **hər fayla ayrıca mapped task** yaradılmır (mapping 1-ci DAG-da göstərilib).
+![Four dynamic task instances](screenshots_second/dynamic-mapping.png)
 
-## 3. Join və Cleanup — Trigger Rules
+## 2. CSV və JSON branch-ləri
+
+**Sual:** Fayl formatına görə CSV və JSON branch-lərini seçin.
+
+**Həll:** `@task.branch` ilə yazılmış `select_branch(files)` siyahıda hansı fayl formatlarının mövcud olduğunu yoxlayır: `.csv` varsa `process_csv`, `.json` varsa `process_json` task ID-sini qaytarır. Hər iki format olduqda **hər iki branch** işləyir.
+
+```python
+@task.branch
+def select_branch(files):
+    chosen = []
+    if any(f.lower().endswith(".csv") for f in files):
+        chosen.append("process_csv")
+    if any(f.lower().endswith(".json") for f in files):
+        chosen.append("process_json")
+    return chosen
+```
+
+**Real nəticə:** `['process_csv', 'process_json']` seçilib. `process_csv` logu 3 CSV obyektinin hərəsində 3 sətir olduğunu göstərir (`curated/sales.csv`, `customers.csv`, `sales.csv`). `process_json` `orders.json` məlumatlarını oxuyub. Branch-lər mövcud fayllar üzrə seçilir; bu kod hər fayla ayrıca CSV/JSON branch task yaratmır.
+
+![Branch selection log](screenshots_second/branch-selection.png)
+
+![CSV processing log](screenshots_second/csv-processing.png)
+
+![JSON processing log](screenshots_second/json-processing.png)
+
+## 3. JOIN və CLEANUP trigger rule-ları
+
+**Sual:** JOIN üçün `none_failed_min_one_success`, CLEANUP üçün `all_done` istifadə edin.
 
 ```python
 @task(trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS)
 def join():
-    print("Selected branches completed successfully")
+    print("Selected branches succeeded")
 
 @task(trigger_rule=TriggerRule.ALL_DONE)
 def cleanup():
-    print("Cleanup executed")
+    print("Cleanup done")
 ```
 
-- **`none_failed_min_one_success`**: JOIN-dən birbaşa əvvəl gələn task-lardan heç biri `failed`/`upstream_failed` olmamalı və ən azı biri `success` olmalıdır. Branching zamanı digər yol `skipped` olsa da JOIN işləyə bilər.
-- **`all_done`**: CLEANUP-un birbaşa upstream task-ları terminal vəziyyətə çatdıqda, onların uğurlu olub-olmamasından asılı olmayaraq cleanup işə başlaya bilər. Bu qayda cleanup-ın özünün mütləq uğurlu olacağı demək deyil.
+- **`none_failed_min_one_success`**: JOIN-in upstream task-larından heç biri `failed`/`upstream_failed` olmamalıdır, ən azı biri `success` olmalıdır. Digər branch `skipped` olsa da JOIN işləyə bilər.
+- **`all_done`**: CLEANUP bütün *birbaşa upstream* task-ları terminal statusa keçəndən sonra işləməyə uyğundur; onların hamısının `success` olması tələb edilmir. `cleanup`-ın öz uğuru isə kodundan asılıdır.
 
-CSV/JSON seçim ssenarisi və JOIN-in `skipped` branch ilə işləməsi yoxlanılıb. Failure sonrası cleanup davranışı ayrıca simulyasiya edilməyib.
+**Real nəticə:** Göndərilən run-da hər iki branch uğurlu olduğuna görə `join` və `cleanup` da `success` olub. **Failure və ya skipped branch ssenarisi bu yeni 2-DAG run şəkillərində ayrıca sübut olunmur.** `publish_sales` yalnız JOIN və CLEANUP uğurlu olduqdan sonra işləyir.
 
-## 4. Producer / Consumer — Asset Scheduling
+![Join success log](screenshots_second/join.png)
 
-- **`sales_producer`**: `S3Hook.load_string()` ilə `advance-airflow/curated/sales.txt` faylını MinIO-ya yazır. `@task(outlets=[sales_asset])` sayəsində task uğurla bitəndə Airflow Asset update event yaradır.
-- **`sales_consumer`**: `schedule=[sales_asset]` olduğuna görə event-dən sonra avtomatik DAG Run alır və MinIO-dakı faylı oxuyur.
+![Cleanup success log](screenshots_second/cleanup.png)
 
-Hər iki DAG eyni identifikatoru istifadə edir:
+## 4. Producer → Sales Asset → Consumer
 
-```python
-sales_asset = Asset("s3://advance-airflow/curated/sales.txt")
-```
+**Sual:** Producer DAG `sales` Asset-i publish etsin; Consumer DAG Asset event ilə başlasın.
 
-**Vacib:** MinIO-ya faylın sadəcə xaricdən yüklənməsi Airflow Asset event yaratmır. Event producer task-ının `outlets` vasitəsilə uğurlu icrası ilə yaranır.
+**Producer:** `publish_sales` MinIO-da `sales.csv` faylını oxuyur, boş olmadığını yoxlayır və `curated/sales.csv` obyektinə yazır. `@task(outlets=[SALES_ASSET])` vasitəsilə uğurlu task icrasında Asset event yaradılır.
 
-## 5. Catchup qərarı və 3 günlük Backfill planı
-
-**Qərar: `catchup=False`.** DAG aktivləşdiriləndə bütün buraxılmış tarixi intervalların avtomatik işləməsini istəmirik. Lazım olan günləri ayrıca seçib backfill etmək daha nəzarətlidir. `catchup=False` manual backfill-i qadağan etmir.
-
-Nümunə `daily_sales` DAG-ı gündəlik schedule ilə nəzərdə tutulur:
+**Consumer:** `schedule=[SALES_ASSET]` olduğuna görə bu event yeni Consumer DAG Run yaradır. Consumer, sensor uğurla bitəndən sonra həmin curated CSV-ni oxuyur.
 
 ```python
-with DAG(
-    dag_id="daily_sales",
-    start_date=pendulum.datetime(2026, 10, 1, tz="UTC"),
-    schedule="@daily",
-    catchup=False,
-    max_active_runs=1,
-) as dag:
+SALES_ASSET = Asset("s3://advance-airflow/curated/sales.csv")
+
+# producer.py
+@task(outlets=[SALES_ASSET])
+def publish_sales():
+    ...  # MinIO-ya curated/sales.csv yazılır
+
+# consumer.py
+with DAG(dag_id="consumer", schedule=[SALES_ASSET], catchup=False, ...) as dag:
     ...
 ```
 
-**Plan:** UTC üzrə **17, 18, 19 oktyabr 2026** tarixlərinin gündəlik data intervalları üçün üç ayrı run. `data_interval_start` və `data_interval_end` hər run-da uyğun dövrü göstərməlidir; real istehsal pipeline-ı bu tarixlərə məxsus data oxumalıdır.
+**Real nəticə:** Producer 3 satış sətrini publish edib. Airflow Assets ekranında `s3://advance-airflow/curated/sales.csv` üçün **1 producing task** və **1 scheduled DAG** görünür. Producer Overview panelində yeni Asset event-in **consumer DAG Run yaratdığı və onun uğurlu olduğu** görünür. MinIO-da `curated/sales.csv` mövcuddur. Ekranda görünən köhnə `curated/sales.txt` daha əvvəlki təcrübədən qalıb və bu iki-DAG axınına aid deyil.
 
-Əvvəl sınaq:
+> Yalnız MinIO-ya xaricdən obyekt yükləmək Airflow Asset event-i yaratmır. Bu layihədə event `publish_sales` task-ının uğurla tamamlanması ilə emit olunur.
+
+![Sales publish log](screenshots_second/publish-sales.png)
+
+![Asset listing](screenshots_second/assets.png)
+
+![MinIO curated file](screenshots_second/minio-curated.png)
+
+## 5. Catchup qərarı və 3 günlük backfill planı
+
+**Sual:** `catchup` qərarını izah edin və 3 günlük backfill planı hazırlayın.
+
+**Qərar:** Hər iki DAG-da `catchup=False` saxlanılır. Producer hazırda `schedule=None` ilə **manual** başlanır; Consumer `schedule=[SALES_ASSET]` ilə **hadisə əsaslı** başlanır. Bu iki konkret schedule üçün keçmiş gündəlik data intervalını Airflow avtomatik yaratmır. `catchup=False` burada avtomatik köhnə periodların kütləvi icrasının nəzərdə tutulmadığını ifadə edir; **özlüyündə 3 günlük backfill yaratmır**.
+
+**Plan: 17, 18 və 19 oktyabr 2026 (UTC) üçün tarixi satış datasını təkrar işləmək.**
+
+| Addım | Tədbir | Gözlənilən yoxlama |
+|---|---|---|
+| 1 | Mənbədə hər günə aid satış faylı/partisiyası hazırlamaq | Hər tarix üçün ayrı input olmalıdır |
+| 2 | Producer-i tarixi emala uyğunlaşdırmaq: seçilən günü `data_interval_start`/parametr vasitəsilə oxumaq və nəticəni tarixlə ayrılmış key-də yazmaq | Gündəlik nəticələr bir-birini əvəz etməsin |
+| 3 | Backfill üçün ayrıca deploy/test konfiqurasiyasında Producer-ə gündəlik timetable (`@daily`) təyin etmək; `start_date` tarixi intervalları əhatə etməlidir | Time-based backfill üçün uyğun schedule |
+| 4 | 17–19 oktyabr üçün `--dry-run` ilə intervalları yoxlamaq | 3 planlı gündəlik interval |
+| 5 | Həqiqi backfill-i `max_active_runs=1` ilə icra etmək | Hər gün üçün Producer nəticəsi və data key-ləri |
+| 6 | Producer hər uğurlu emaldan sonra Asset event emit edir; Consumer-in event-lə başlamasını ayrıca müşahidə etmək | Consumer run-ları və event mapping yoxlanılır |
+
+Airflow 3.1 üçün **planlaşdırılan** əmrlər (yalnız Producer gündəlik schedule-a uyğunlaşdırılıbsa):
 
 ```powershell
-docker compose exec airflow-scheduler airflow backfill create --dag-id daily_sales --from-date 2026-10-17 --to-date 2026-10-19 --reprocess-behavior none --max-active-runs 1 --dry-run
+docker compose exec airflow-scheduler airflow backfill create --dag-id producer --from-date 2026-10-17 --to-date 2026-10-19 --reprocess-behavior none --max-active-runs 1 --dry-run
+
+docker compose exec airflow-scheduler airflow backfill create --dag-id producer --from-date 2026-10-17 --to-date 2026-10-19 --reprocess-behavior none --max-active-runs 1
 ```
 
-Sonra (yoxlama uğurlu olduqda) icra:
+**Vacib məhdudiyyət:** Hal-hazırdakı `producer` DAG-ında `schedule=None`-dur və kod `sales.csv`-ni tarixə görə filtr etmir. Buna görə yuxarıdakı backfill əmrlərini **mövcud kodda dəyişiklik etmədən işlətmək düzgün deyil**. Consumer-i də gündəlik time-based backfill kimi təqdim etmirik: o, Asset event ilə başlayır. **Bu tapşırıq üzrə README-də plan hazırlanıb, 3 günlük backfill faktiki icra edilməyib.**
 
-```powershell
-docker compose exec airflow-scheduler airflow backfill create --dag-id daily_sales --from-date 2026-10-17 --to-date 2026-10-19 --reprocess-behavior none --max-active-runs 1
-```
+## 6. ExternalTaskSensor — başqa DAG-dakı `load_source`
 
-`--reprocess-behavior none` eyni logical date üçün mövcud run-u təkrar yaratmır. `--max-active-runs 1` backfill run-larının paralelliyini məhdudlaşdırır. **Bu komandalar təqdim edilən plandır; layihədə uğurla işlədilməsi təsdiqlənməyib.** `schedule=None` olan DAG üçün bu tip time-based backfill uyğun deyil.
+**Sual:** Başqa DAG-dakı `load_source` task-ını gözləyən `ExternalTaskSensor` əlavə edin.
 
-## 6. ExternalTaskSensor — DAG-lar arası asılılıq
-
-Bu hissə iki DAG-dan ibarətdir:
-
-1. `source_ingestion`: `trigger_waiter` ilə `source_waiter` DAG-ını avtomatik başladır, sonra `load_source` ilə MinIO-ya `source/source.txt` yazır.
-2. `source_waiter`: `wait_for_ingestion` adlı `ExternalTaskSensor` eyni **logical date** üzrə `source_ingestion.load_source` task-ının `success` statusunu gözləyir; sonra `mart_build` task-ı faylı oxuyur.
-
-Sensorun nüvəsi:
+**Həll:** `consumer.wait_for_ingestion`, `producer.load_source` task-ının `success` olmasını yoxlayır. Consumer Asset event ilə başladığına görə onun logical date-i Producer run-ının logical date-i ilə avtomatik eyni deyil. Bunun üçün Producer `publish_sales` task-ında Asset event-in `extra` sahəsinə öz logical date-ini yazır; Consumer-də `producer_logical_date` funksiyası bu məlumatı oxuyub `execution_date_fn` vasitəsilə sensora ötürür.
 
 ```python
+# producer.py — publish_sales daxilində
+context = get_current_context()
+context["outlet_events"][SALES_ASSET].extra = {
+    "producer_logical_date": context["logical_date"].isoformat()
+}
+
+# consumer.py
 wait_for_ingestion = ExternalTaskSensor(
     task_id="wait_for_ingestion",
-    external_dag_id="source_ingestion",
+    external_dag_id="producer",
     external_task_id="load_source",
+    execution_date_fn=producer_logical_date,
     allowed_states=["success"],
     failed_states=["failed"],
     poke_interval=10,
@@ -127,36 +197,66 @@ wait_for_ingestion = ExternalTaskSensor(
 )
 ```
 
-`TriggerDagRunOperator` istifadə edilməsinin səbəbi UI-dən yalnız `source_ingestion` DAG-ını manual başladarkən ikinci DAG-ın **eyni logical date** ilə avtomatik trigger edilməsidir. Bu mexanizm `ExternalTaskSensor`-u əvəz etmir: sensor yenə də başqa DAG-dakı task statusunu yoxlayır.
+**Real nəticə:** Son Consumer run **asset-triggered** olub və hər iki task (`wait_for_ingestion`, `mart_build`) `success`-dur. Sensorun logunda `Poking for tasks ['load_source'] in dag producer` və `Success criteria met. Exiting.` görünür. Bu run-da Producer artıq tamamlandığı üçün **sensorun gözləyib reschedule edilməsini göstərən ayrıca log yoxdur**; sadəcə düzgün xarici task vəziyyətini aşkarladığı sübut olunur.
 
-UI testində `trigger_waiter`, `load_source`, `wait_for_ingestion`, `mart_build` task-ları `success` olub. Sensor logunda `UP_FOR_RESCHEDULE` və sonradan `Success criteria met` mesajları görünür.
+`mart_build` MinIO-dan `curated/sales.csv` faylını oxuyur və **3 satış sətrini** loglayır. Nümunədə `mart_build` real SQL mart cədvəli yaratmır, oxuma/emal mərhələsinin sadə nümayişidir.
 
-## 7. Deferrable Sensors və Triggerer — nəzəri izah
+![Consumer overview](screenshots_second_second/consumer-overview.png)
 
-| Rejim | Gözləyərkən worker slotu | Tələb |
-|---|---|---|
-| `poke` | Gözləmə müddətində tutulur | Adi sensor icrası |
-| `reschedule` | Yoxlamalar arasında buraxılır | Scheduler növbəti yoxlamanı planlaşdırır |
-| `deferrable=True` | Task defer edildikdən sonra boşalır | **İşləyən Triggerer** və uyğun sensor/provider dəstəyi |
+![ExternalTaskSensor log](screenshots_second_second/external-sensor.png)
 
-**Deferrable ardıcıllığı:** Worker task-ı başladır → task `deferred` olur və worker slotunu boşaldır → Triggerer gözləmə hadisəsini asinxron izləyir → şərt ödənəndə task worker-də davam edir.
+![Mart build reads three rows](screenshots_second/mart-build.png)
 
-Məsələn, uyğun provider dəstəkləyirsə:
+## 7. Deferrable rejim və Triggerer tələbi
+
+**Sual:** Uyğun sensor üçün deferrable rejimini və Triggerer tələbini izah edin.
+
+| Rejim | Gözləmə zamanı worker slotu | Necə işləyir? | Triggerer |
+|---|---|---|---|
+| `poke` | Tutulur | Worker sensoru təkrar yoxlayır | Lazım deyil |
+| `reschedule` | Yoxlamalar arasında boşalır | Scheduler sensoru növbəti yoxlama üçün yenidən planlaşdırır | Lazım deyil |
+| `deferrable=True` | Defer-dən sonra boşalır | Async Triggerer hadisəni izləyir; şərt ödənəndə task yenidən worker-ə qayıdır | **Tələb olunur** |
+
+**Dörd mərhələ:** `Worker starts → Defer → Triggerer waits → Resume on worker`.
+
+`ExternalTaskSensor` deferrable rejimi dəstəkləyir. Nəzəri alternativ:
 
 ```python
 ExternalTaskSensor(
     task_id="wait_for_ingestion",
-    external_dag_id="source_ingestion",
+    external_dag_id="producer",
     external_task_id="load_source",
+    execution_date_fn=producer_logical_date,
+    poke_interval=10,
+    timeout=300,
     deferrable=True,
 )
 ```
 
-`deferrable=True` üçün ayrıca **`airflow triggerer` prosesi** işləməlidir. Docker Compose-da bunun üçün `airflow-triggerer` servisi əlavə oluna bilər. Triggerer işləmirsə, deferred task normal şəkildə davam edə bilməz. Bizim **praktiki həll `mode="reschedule", deferrable=False`** ilə işləyir; buna görə mövcud test üçün Triggerer tələb olunmur.
+- Triggerer ayrıca Airflow prosesi (`airflow triggerer`) kimi aktiv olmalıdır; Docker Compose-a müvafiq servis əlavə etmək olar.
+- Sensor/operator və onun provider versiyası `deferrable` rejimini dəstəkləməlidir.
+- Triggerer işləməsə deferred task davam etməyə bilər.
+- Uzun gözləmə və çoxsaylı sensorlarda deferrable daha resurs-səmərəlidir; qısa gözləmədə fərq kiçik ola bilər.
 
-## İşə salma və yoxlama
+**Layihədə praktik olaraq `mode="reschedule", deferrable=False` istifadə edilib. Triggerer servisi quraşdırıldığı və ya deferrable run icra edildiyi iddia olunmur.**
 
-Layihənin Docker Compose qovluğunda:
+## Quruluş və işə salma
+
+```text
+advance-airflow/
+├── airflow/
+│   └── dags/
+│       ├── producer.py
+│       └── consumer.py
+├── screenshots_second/
+├── docker-compose.yaml
+├── Dockerfile
+├── requirements.txt
+├── .gitignore
+└── README.md
+```
+
+Göstərilən iki fayl müəllimin qiymətləndirəcəyi DAG-lardır. Digər köhnə test DAG-ları lokal mühitdən təqdimat zamanı kənara çıxarıla bilər. `.env` və şifrələr GitHub-a yüklənməməlidir. MinIO-da `advance-airflow` bucket-i, başlanğıc `sales.csv`, `customers.csv`, `orders.json` obyektləri və Airflow-da `minio_s3` AWS tipli Connection olmalıdır.
 
 ```powershell
 docker compose up -d
@@ -166,34 +266,18 @@ docker compose exec airflow-scheduler airflow dags list-import-errors
 
 - Airflow UI: `http://localhost:8081`
 - MinIO UI: `http://localhost:9003`
-- MinIO endpoint (Docker şəbəkəsi daxilindən): `http://minio:9000`
-- MinIO bucket: `advance-airflow`
-- Airflow Connection ID: `minio_s3` (`Amazon Web Services` tipli, MinIO endpoint-lə)
+- MinIO endpoint (Docker şəbəkəsi): `http://minio:9000`
 
-Connection credentials `.env` / lokal təhlükəsiz konfiqurasiyada saxlanmalıdır, README-yə və GitHub-a əlavə olunmamalıdır. `.env` faylını `.gitignore`-a daxil edin. Test üçün əvvəl MinIO bucket və faylları yaradılmalıdır.
+**Test qaydası:** Hər iki DAG unpaused olsun → yalnız **`producer`** üçün manual Trigger → `publish_sales` success → yeni Asset event → **`consumer`** avtomatik run → `wait_for_ingestion` və `mart_build` success. Əvvəlki uğursuz run yeni uğurlu run-ın nəticəsini dəyişmir.
 
-### Ekran görüntüləri
+## Yekun və yoxlama sərhədləri
 
-Aşağıdakı adlarla `screenshots/` qovluğunda şəkillər yerləşdirilə bilər (mövcud olmayan fayllara qırıq image linki verməmək üçün sadəcə adlar göstərilib):
+- **Praktik təsdiqlənənlər:** 4 mapped task instance, CSV/JSON branch-ləri, uğurlu JOIN və CLEANUP, MinIO curated sales faylı, sales Asset event ilə Consumer-in avtomatik işləməsi, ExternalTaskSensor success, mart_build-in 3 sətir oxuması.
+- **Plan/nəzəri hissələr:** 3 günlük backfill, `deferrable=True` və Triggerer.
+- **Ayrıca yoxlanılmayanlar:** branch failure/skipped ssenarisində cleanup davranışı, 3 tarix üçün real backfill, deferrable sensorun Triggerer ilə faktiki gözləməsi.
 
-| Fayl | Göstərilən sübut |
-|---|---|
-| `01-dynamic-mapping.png` | 3 mapped instance, hamısı `success` |
-| `02-branching.png` | CSV/JSON branch-ləri işləyir |
-| `03-trigger-rules.png` | Skipped branch + uğurlu JOIN/CLEANUP |
-| `04-sales-producer.png` | Producer task `success` |
-| `05-sales-consumer.png` | Asset ilə işə düşmüş Consumer |
-| `06-sales-asset.png` | Asset event və URI |
-| `07-minio-sales.png` | `curated/sales.txt` MinIO-da |
-| `08-source-ingestion.png` | `trigger_waiter` və `load_source` `success` |
-| `09-external-sensor.png` | `wait_for_ingestion` və `mart_build` `success` |
-| `10-sensor-logs.png` | Poking → reschedule → success |
+### Mənbələr
 
-## Yekun
-
-Layihədə Airflow-un task mapping, branching, trigger rules, Asset Scheduling, `ExternalTaskSensor` və MinIO ilə Connection/Hook inteqrasiyası nümayiş etdirilir. **Catchup/backfill** və **deferrable/Triggerer** hissələri üçün nəzəri əsaslandırma və icra planı verilib; real test edilməyən nəticələr uğurlu icra kimi təqdim olunmur.
-
-## Sənədlər
-
-- [Apache Airflow — Backfill](https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/backfill.html)
-- [Apache Airflow — Deferrable Operators & Triggers](https://airflow.apache.org/docs/apache-airflow/stable/authoring-and-scheduling/deferring.html)
+- [Airflow Backfill](https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/backfill.html)
+- [Airflow Deferrable Operators & Triggers](https://airflow.apache.org/docs/apache-airflow/stable/authoring-and-scheduling/deferring.html)
+- [Airflow Asset Scheduling](https://airflow.apache.org/docs/apache-airflow/stable/authoring-and-scheduling/assets.html)
