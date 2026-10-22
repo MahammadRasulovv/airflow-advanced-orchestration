@@ -42,7 +42,7 @@ load_source → discover_files → process_file.expand() → select_branch
 | 6 | Digər DAG-dakı `load_source`-u gözləyən sensor | `consumer.wait_for_ingestion` | Sensor uyğun Producer task-ını tapıb uğurla keçib |
 | 7 | Deferrable rejim, Triggerer tələbi | Sensor alternativi + bu README | **Nəzəri izah**, Triggerer testi edilməyib |
 
-![Producer DAG overview](screenshots_second/producer-overview.png)
+![Producer DAG overview](screenshots_second/producer%20dag%20run.png)
 
 ---
 
@@ -59,9 +59,9 @@ mapped = process_file.expand(file_name=files)
 
 **Real nəticə:** `discover_files` logu `curated/sales.csv`, `customers.csv`, `orders.json`, `sales.csv` fayllarını qaytarır; buna görə **4 mapped instance** yaranıb. Əvvəlki sınaqlarda 3 idi; yeni `curated/sales.csv` əlavə olunduğuna görə say 4-ə yüksəlib. Bu nümunədə curated fayl da siyahıya daxil edilir; istehsal layihəsində yalnız raw/source prefix seçmək daha məqsədəuyğundur.
 
-![MinIO discovered files](screenshots_second/discover-files.png)
+![MinIO discovered files](screenshots_second/discover%20dags%20log.png)
 
-![Four dynamic task instances](screenshots_second/dynamic-mapping.png)
+![Four dynamic task instances](screenshots_second/process_%20file.png)
 
 ## 2. CSV və JSON branch-ləri
 
@@ -82,11 +82,11 @@ def select_branch(files):
 
 **Real nəticə:** `['process_csv', 'process_json']` seçilib. `process_csv` logu 3 CSV obyektinin hərəsində 3 sətir olduğunu göstərir (`curated/sales.csv`, `customers.csv`, `sales.csv`). `process_json` `orders.json` məlumatlarını oxuyub. Branch-lər mövcud fayllar üzrə seçilir; bu kod hər fayla ayrıca CSV/JSON branch task yaratmır.
 
-![Branch selection log](screenshots_second/branch-selection.png)
+![Branch selection log](screenshots_second/select%20branch%20log.png)
 
-![CSV processing log](screenshots_second/csv-processing.png)
+![CSV processing log](screenshots_second/process%20csv%20log.png)
 
-![JSON processing log](screenshots_second/json-processing.png)
+![JSON processing log](screenshots_second/process%20json%20log.png)
 
 ## 3. JOIN və CLEANUP trigger rule-ları
 
@@ -107,9 +107,9 @@ def cleanup():
 
 **Real nəticə:** Göndərilən run-da hər iki branch uğurlu olduğuna görə `join` və `cleanup` da `success` olub. **Failure və ya skipped branch ssenarisi bu yeni 2-DAG run şəkillərində ayrıca sübut olunmur.** `publish_sales` yalnız JOIN və CLEANUP uğurlu olduqdan sonra işləyir.
 
-![Join success log](screenshots_second/join.png)
+![Join success log](screenshots_second/join%20log.png)
 
-![Cleanup success log](screenshots_second/cleanup.png)
+![Cleanup success log](screenshots_second/cleanup%20log.png)
 
 ## 4. Producer → Sales Asset → Consumer
 
@@ -136,11 +136,11 @@ with DAG(dag_id="consumer", schedule=[SALES_ASSET], catchup=False, ...) as dag:
 
 > Yalnız MinIO-ya xaricdən obyekt yükləmək Airflow Asset event-i yaratmır. Bu layihədə event `publish_sales` task-ının uğurla tamamlanması ilə emit olunur.
 
-![Sales publish log](screenshots_second/publish-sales.png)
+![Sales publish log](screenshots_second/publish%20sales.png)
 
-![Asset listing](screenshots_second/assets.png)
+![Asset listing](screenshots_second/assets%20view.png)
 
-![MinIO curated file](screenshots_second/minio-curated.png)
+![MinIO curated file](screenshots_second/minio%20view.png)
 
 ## 5. Catchup qərarı və 3 günlük backfill planı
 
@@ -201,11 +201,11 @@ wait_for_ingestion = ExternalTaskSensor(
 
 `mart_build` MinIO-dan `curated/sales.csv` faylını oxuyur və **3 satış sətrini** loglayır. Nümunədə `mart_build` real SQL mart cədvəli yaratmır, oxuma/emal mərhələsinin sadə nümayişidir.
 
-![Consumer overview](screenshots_second_second/consumer-overview.png)
+![Consumer overview](screenshots_second/consumer%20dag%20run.png)
 
-![ExternalTaskSensor log](screenshots_second_second/external-sensor.png)
+![ExternalTaskSensor log](screenshots_second/wait%20for%20ingestion%20log.png)
 
-![Mart build reads three rows](screenshots_second/mart-build.png)
+![Mart build reads three rows](screenshots_second/mart%20build%20log.png)
 
 ## 7. Deferrable rejim və Triggerer tələbi
 
@@ -248,7 +248,7 @@ advance-airflow/
 │   └── dags/
 │       ├── producer.py
 │       └── consumer.py
-├── screenshots_second/
+├── screenshots/
 ├── docker-compose.yaml
 ├── Dockerfile
 ├── requirements.txt
